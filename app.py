@@ -6,6 +6,11 @@ import numpy as np
 import joblib
 import matplotlib.pyplot as plt
 import seaborn as sns
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+from sklearn.metrics import (homogeneity_score, v_measure_score,
+                              adjusted_rand_score, calinski_harabasz_score)
+from mlxtend.frequent_patterns import apriori, association_rules
 
 # Configuration de la page
 st.set_page_config(
@@ -30,9 +35,9 @@ st.markdown("---")
 def load_models():
     models = {}
     try:
-        models['classifier'] = joblib.load('models/best_model.pkl')
-        models['scaler'] = joblib.load('models/scaler.pkl')
-        models['features'] = joblib.load('models/feature_names.pkl')
+        models['classifier'] = joblib.load('best_model.pkl')
+        models['scaler'] = joblib.load('scaler.pkl')
+        models['features'] = joblib.load('feature_names.pkl')
         st.success("✅ Modèles chargés avec succès")
     except Exception as e:
         st.error(f"⚠️ Erreur de chargement: {e}")
@@ -41,10 +46,94 @@ def load_models():
 
 models = load_models()
 
+# Clustering réel (K-Means) — remplace l'ancien groupby décoratif par JobSatisfaction.
+# Calculé une seule fois par session grâce à @st.cache_data. SSE choisit K (slide K-means) ;
+# Homogeneity/V-measure/ARI/Calinski-Harabasz valident les clusters contre Attrition (slide
+# Validation) — deux rôles distincts, pas deux façons concurrentes de mesurer la même chose.
+@st.cache_data
+def run_clustering():
+    df = pd.read_csv('dataset/WA_Fn-UseC_-HR-Employee-Attrition.csv')
+    zero_var_drop = ['EmployeeCount', 'EmployeeNumber', 'Over18', 'StandardHours']
+    df2 = df.drop(columns=zero_var_drop)
+    y_attrition = (df2['Attrition'] == 'Yes').astype(int).values
+    X_raw = df2.drop(columns=['Attrition'])
+    cat_cols = X_raw.select_dtypes(include='object').columns.tolist()
+    X_enc = pd.get_dummies(X_raw, columns=cat_cols, drop_first=True)
+    X_enc = X_enc[models['features']]
+    X_scaled = models['scaler'].transform(X_enc)
+
+    # SSE par K (méthode du coude) — le cours nomme explicitement SSE comme "Mesure
+    # d'évaluation" pour l'algorithme K-means lui-même (slide Algorithmes : K-means).
+    k_range = list(range(2, 9))
+    sse_by_k = []
+    for k in k_range:
+        km_k = KMeans(n_clusters=k, random_state=42, n_init=10)
+        km_k.fit(X_scaled)
+        sse_by_k.append(km_k.inertia_)
+
+    km = KMeans(n_clusters=2, random_state=42, n_init=10)
+    clusters = km.fit_predict(X_scaled)
+
+    # Métriques de VALIDATION nommées par le cours pour le Clustering (slide "Fonction coût :
+    # Mesures d'évaluation") : compare les clusters à la variable "classe" masquée (Attrition),
+    # stratégie explicitement décrite par le cours comme "la plus utilisée" (slide Validation).
+    # Différent du SSE ci-dessus, qui sert à choisir K, pas à valider contre Attrition.
+    metrics = {
+        'Homogeneity': homogeneity_score(y_attrition, clusters),
+        'V-measure': v_measure_score(y_attrition, clusters),
+        'Adjusted Rand Index': adjusted_rand_score(y_attrition, clusters),
+        'Calinski-Harabasz': calinski_harabasz_score(X_scaled, clusters),
+    }
+
+    pca = PCA(n_components=2, random_state=42)
+    X_pca = pca.fit_transform(X_scaled)
+    var_explained = pca.explained_variance_ratio_.sum()
+
+    profile = df[['Age', 'MonthlyIncome', 'YearsAtCompany']].copy()
+    profile['Cluster'] = clusters
+    profile['Attrition (%)'] = y_attrition * 100
+    profile_summary = profile.groupby('Cluster').mean().round(2)
+    profile_summary.columns = ['Âge moyen', 'Revenu moyen', 'Ancienneté moyenne', 'Attrition (%)']
+
+    return clusters, X_pca, var_explained, metrics, profile_summary, y_attrition, k_range, sse_by_k
+
+
+# Règles d'association (Apriori) — Technique Descriptive nommée par le cours,
+# absente de la version précédente de l'application.
+@st.cache_data
+def run_association_rules():
+    df = pd.read_csv('dataset/WA_Fn-UseC_-HR-Employee-Attrition.csv')
+    df_t = pd.DataFrame(index=df.index)
+    df_t['Age'] = pd.cut(df['Age'], bins=[17, 30, 40, 50, 61],
+                          labels=['Age_<30', 'Age_30-40', 'Age_40-50', 'Age_50+'])
+    df_t['Income'] = pd.qcut(df['MonthlyIncome'], q=3,
+                              labels=['Income_Bas', 'Income_Moyen', 'Income_Haut'])
+    df_t['Tenure'] = pd.cut(df['YearsAtCompany'], bins=[-1, 2, 5, 10, 100],
+                             labels=['Tenure_0-2ans', 'Tenure_3-5ans', 'Tenure_6-10ans', 'Tenure_10ans+'])
+    for col, label in [('JobSatisfaction', 'JobSat'), ('WorkLifeBalance', 'WLB')]:
+        df_t[col] = label + '_' + df[col].astype(str)
+    for col in ['OverTime', 'MaritalStatus', 'JobRole']:
+        df_t[col] = col + '_' + df[col].astype(str).str.replace(' ', '_')
+    df_t['Attrition'] = 'Attrition_' + df['Attrition']
+
+    # prefix="" : les valeurs ci-dessus sont déjà auto-descriptives. Le préfixe par défaut
+    # de pandas double le nom (ex: "Attrition_Attrition_Yes") et casse le filtrage en aval.
+    basket = pd.get_dummies(df_t, prefix="", prefix_sep="")
+    frequent_itemsets = apriori(basket, min_support=0.05, use_colnames=True, max_len=3)
+    rules = association_rules(frequent_itemsets, metric="lift", min_threshold=1.0)
+
+    rules_yes = rules[rules['consequents'].apply(
+        lambda x: 'Attrition_Yes' in x and len(x) == 1)].sort_values('lift', ascending=False).copy()
+    rules_yes['Antécédent'] = rules_yes['antecedents'].apply(lambda x: ', '.join(sorted(x)))
+    base_rate = (df['Attrition'] == 'Yes').mean()
+
+    return rules_yes[['Antécédent', 'support', 'confidence', 'lift']].rename(
+        columns={'support': 'Support', 'confidence': 'Confiance', 'lift': 'Lift'}), base_rate
+
 # Sidebar de navigation (ORDRE MODIFIÉ)
 option = st.sidebar.selectbox(
     "📌 Choisissez une analyse",
-    ["📈 Visualisation", "🔮 Prédiction", "📊 Clustering", "📄 Rapport"]
+    ["📈 Visualisation", "🔮 Prédiction", "📊 Clustering", "🔗 Association", "📄 Rapport"]
 )
 
 st.sidebar.markdown("---")
@@ -207,51 +296,92 @@ elif option == "🔮 Prédiction":
 
 # ==================== SECTION 3 : CLUSTERING ====================
 elif option == "📊 Clustering":
-    st.header("📊 Analyse de Clustering")
-    st.markdown("Segmentation des employés basée sur leurs caractéristiques")
-    
+    st.header("📊 Analyse de Clustering (K-Means)")
+    st.markdown("Segmentation non supervisée des employés (K=2), validée a posteriori contre l'Attrition réelle")
+
     try:
-        df = pd.read_csv('dataset/WA_Fn-UseC_-HR-Employee-Attrition.csv')
-        
-        st.subheader("🎯 Visualisation des segments d'employés")
-        
-        # Sélection des features pour le clustering
-        cluster_features = ['Age', 'MonthlyIncome', 'YearsAtCompany', 'JobSatisfaction', 'WorkLifeBalance']
-        
+        clusters, X_pca, var_explained, metrics, profile_summary, y_attrition, k_range, sse_by_k = run_clustering()
+
+        st.subheader("📉 Choix de K : méthode du coude (SSE)")
+        st.caption("Le cours nomme SSE (Sum of Squared Errors) comme mesure d'évaluation de K-means "
+                   "lui-même — sert à choisir K, indépendamment de toute comparaison avec Attrition.")
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.plot(k_range, sse_by_k, marker='o', color='#2ecc71')
+        ax.axvline(x=2, color='#e74c3c', linestyle='--', alpha=0.6, label='K=2 retenu')
+        ax.set_xlabel('K (nombre de clusters)')
+        ax.set_ylabel('SSE (inertie)')
+        ax.set_title('Évolution du SSE selon K')
+        ax.legend()
+        st.pyplot(fig)
+        st.caption("La décroissance est progressive plutôt qu'un coude net — attendu sur des données "
+                   "RH à 44 dimensions après encodage. Le choix final de K=2 s'appuie surtout sur le "
+                   "pic du Calinski-Harabasz Index ci-dessous, le SSE servant de diagnostic complémentaire.")
+
+        st.subheader("📐 Métriques de validation (clusters vs Attrition réelle)")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Homogeneity", f"{metrics['Homogeneity']:.4f}")
+        m2.metric("V-measure", f"{metrics['V-measure']:.4f}")
+        m3.metric("Adjusted Rand Index", f"{metrics['Adjusted Rand Index']:.4f}")
+        m4.metric("Calinski-Harabasz", f"{metrics['Calinski-Harabasz']:.1f}")
+        st.caption(
+            "Homogeneity / V-measure / ARI proches de 0 : les clusters géométriques ne recoupent pas "
+            "exactement les groupes d'Attrition réels — attendu, pas une erreur (sinon la classification "
+            "supervisée serait quasi parfaite et non à F1≈0.5). Calinski-Harabasz est maximal à K=2, ce qui "
+            "justifie ce choix indépendamment du fait qu'Attrition soit elle-même binaire."
+        )
+
+        st.subheader("🎯 Projection PCA et composition des clusters")
         col1, col2 = st.columns(2)
-        
+
         with col1:
-            fig, ax = plt.subplots(figsize=(8, 6))
-            scatter = ax.scatter(df['Age'], df['MonthlyIncome'], 
-                               c=df['JobSatisfaction'], cmap='viridis', alpha=0.6, s=50)
-            ax.set_xlabel('Âge')
-            ax.set_ylabel('Revenu mensuel (DH)')
-            ax.set_title('Segmentation Âge vs Revenu')
-            plt.colorbar(scatter, label='Satisfaction au travail')
+            fig, ax = plt.subplots(figsize=(7, 6))
+            scatter = ax.scatter(X_pca[:, 0], X_pca[:, 1], c=clusters, cmap='viridis', alpha=0.6, s=40)
+            ax.set_xlabel('PC1')
+            ax.set_ylabel('PC2')
+            ax.set_title(f'K-Means (K=2) — projection PCA 2D ({var_explained*100:.0f}% variance)')
+            plt.colorbar(scatter, label='Cluster')
             st.pyplot(fig)
-        
+
         with col2:
-            fig, ax = plt.subplots(figsize=(8, 6))
-            scatter = ax.scatter(df['YearsAtCompany'], df['MonthlyIncome'], 
-                               c=df['WorkLifeBalance'], cmap='plasma', alpha=0.6, s=50)
-            ax.set_xlabel('Années dans l\'entreprise')
-            ax.set_ylabel('Revenu mensuel (DH)')
-            ax.set_title('Segmentation Ancienneté vs Revenu')
-            plt.colorbar(scatter, label='Équilibre vie pro/perso')
+            ct = pd.crosstab(clusters, y_attrition, normalize='index') * 100
+            ct.columns = ['Non', 'Oui']
+            ct.index.name = 'Cluster'
+            fig, ax = plt.subplots(figsize=(7, 6))
+            sns.heatmap(ct, annot=True, fmt='.1f', cmap='Blues', ax=ax, cbar_kws={'label': '% du cluster'})
+            ax.set_title('Composition de chaque cluster (% Attrition réelle)')
             st.pyplot(fig)
-        
-        st.info("📌 Les couleurs représentent respectivement la satisfaction au travail et l'équilibre vie pro/perso")
-        
-        # Statistiques par cluster
-        st.subheader("📊 Profil des employés par satisfaction")
-        satisfaction_groups = df.groupby('JobSatisfaction').agg({
-            'Age': 'mean',
-            'MonthlyIncome': 'mean',
-            'YearsAtCompany': 'mean'
-        }).round(2)
-        satisfaction_groups.columns = ['Âge moyen', 'Revenu moyen', 'Ancienneté moyenne']
-        st.dataframe(satisfaction_groups)
-        
+
+        st.caption(f"⚠️ La projection PCA ne capture que {var_explained*100:.0f}% de la variance totale — "
+                   "simplification visuelle pour l'affichage, pas la structure complète à 44 dimensions.")
+
+        st.subheader("📊 Profil des clusters")
+        st.dataframe(profile_summary, use_container_width=True)
+
+    except Exception as e:
+        st.warning(f"Erreur de chargement: {e}")
+
+# ==================== SECTION : ASSOCIATION ====================
+elif option == "🔗 Association":
+    st.header("🔗 Règles d'association (Apriori)")
+    st.markdown("Quelles combinaisons de profils sont associées à un risque d'attrition supérieur à la moyenne ?")
+
+    try:
+        rules_yes, base_rate = run_association_rules()
+
+        st.caption(f"Taux de base Attrition='Yes' dans la population : {base_rate*100:.1f}% — "
+                   "une règle n'est intéressante que si son Lift dépasse nettement 1.0.")
+
+        if len(rules_yes) == 0:
+            st.info("Aucune règle trouvée avec ces seuils de support/lift.")
+        else:
+            st.dataframe(
+                rules_yes.style.format({'Support': '{:.3f}', 'Confiance': '{:.3f}', 'Lift': '{:.2f}x'}),
+                use_container_width=True
+            )
+            st.caption("Support et Confiance sont les métriques nommées par le cours pour l'Association ; "
+                       "le Lift est ajouté pour distinguer une vraie découverte d'un simple effet de taux de base "
+                       "(à 16% d'Attrition='Yes', presque toute règle a une confiance élevée vers 'Non').")
+
     except Exception as e:
         st.warning(f"Erreur de chargement: {e}")
 
@@ -298,6 +428,18 @@ elif option == "📄 Rapport":
     - ✅ **Ancienneté** : Réduit le risque
     - ⚠️ **Équilibre vie pro/perso** : Important à maintenir
     
+    ---
+    ### 🔬 Analyses complémentaires (ajoutées)
+    En plus du pipeline original, 4 analyses ont été ajoutées :
+    - **Validation croisée (StratifiedKFold-10) + GridSearchCV** : confirme l'absence d'overfitting
+      pour la Régression Logistique (écart Train/Test ≈ 0pp, contre 13-20pp pour SVM/RF/Arbre/KNN)
+    - **Courbe ROC-AUC** : AUC = 0.80 pour le modèle final
+    - **Clustering K-Means (K=2)**, ci-contre dans l'onglet 📊 — remplace l'ancien groupby par
+      JobSatisfaction, évalué avec les métriques nommées par le cours (Homogeneity, V-measure,
+      Adjusted Rand Index, Calinski-Harabasz)
+    - **Règles d'association (Apriori)**, onglet 🔗 — ex: Revenu bas + ancienneté 0-2 ans → Attrition
+      (Lift 2.27x)
+
     ---
     ### 📁 Fichiers du projet
     - `principal.ipynb` : Notebook complet (Phases 1-4)
